@@ -45,7 +45,54 @@ os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
 DEFAULT_DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "NovaDVR")
 
 # ─────────────────────────────────────────────
-# SQLite Persistent Job Queue
+# YouTube cookies — anti-bot bypass for cloud deployments
+#
+# Set YOUTUBE_COOKIES_B64 env var to base64-encoded cookies.txt
+# (base64 avoids env var size limits on Render/Railway)
+#
+# To encode: in PowerShell:
+#   [Convert]::ToBase64String([IO.File]::ReadAllBytes("cookies.txt")) | Set-Clipboard
+# ─────────────────────────────────────────────
+
+import base64 as _base64
+
+_COOKIE_FILE: str | None = None
+
+def _setup_cookies():
+    global _COOKIE_FILE
+    # Try base64 first (avoids env var size limits)
+    b64 = os.environ.get("YOUTUBE_COOKIES_B64", "").strip()
+    if b64:
+        try:
+            cookie_content = _base64.b64decode(b64).decode("utf-8")
+        except Exception as e:
+            logger.warning(f"Failed to decode YOUTUBE_COOKIES_B64: {e}")
+            cookie_content = ""
+    else:
+        cookie_content = os.environ.get("YOUTUBE_COOKIES", "").strip()
+
+    if not cookie_content:
+        logger.info("No YouTube cookies configured")
+        return None
+    try:
+        tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", prefix="yt_cookies_",
+            delete=False, encoding="utf-8"
+        )
+        tmp.write(cookie_content)
+        tmp.close()
+        _COOKIE_FILE = tmp.name
+        logger.info(f"YouTube cookies loaded → {_COOKIE_FILE}")
+    except Exception as e:
+        logger.warning(f"Failed to write cookie file: {e}")
+    return _COOKIE_FILE
+
+_setup_cookies()
+
+def _cookie_opts() -> dict:
+    if _COOKIE_FILE and os.path.exists(_COOKIE_FILE):
+        return {"cookiefile": _COOKIE_FILE}
+    return {}
 # ─────────────────────────────────────────────
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "jobs.db")
