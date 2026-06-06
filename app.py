@@ -32,26 +32,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("nova_dvr")
 
-
 # ─────────────────────────────────────────────
-# Directories
-# ─────────────────────────────────────────────
-
-# Primary: temp dir — file is streamed to browser → goes to system Downloads
-TEMP_DOWNLOAD_DIR = os.path.join(tempfile.gettempdir(), "nova_dvr_temp")
-os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
-
-# Secondary: user-configured persistent directory (optional)
-DEFAULT_DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "NovaDVR")
-
-# ─────────────────────────────────────────────
-# YouTube cookies — anti-bot bypass for cloud deployments
-#
-# Set YOUTUBE_COOKIES_B64 env var to base64-encoded cookies.txt
-# (base64 avoids env var size limits on Render/Railway)
-#
-# To encode: in PowerShell:
-#   [Convert]::ToBase64String([IO.File]::ReadAllBytes("cookies.txt")) | Set-Clipboard
+# YouTube cookies — anti-bot bypass for cloud IPs
+# Set YOUTUBE_COOKIES_B64 on Railway/Render to base64-encoded cookies.txt
+# PowerShell encode: [Convert]::ToBase64String([IO.File]::ReadAllBytes("cookies.txt")) | Out-File cookies_b64.txt -NoNewline
 # ─────────────────────────────────────────────
 
 import base64 as _base64
@@ -60,7 +44,6 @@ _COOKIE_FILE: str | None = None
 
 def _setup_cookies():
     global _COOKIE_FILE
-    # Try base64 first (avoids env var size limits)
     b64 = os.environ.get("YOUTUBE_COOKIES_B64", "").strip()
     if b64:
         try:
@@ -90,9 +73,25 @@ def _setup_cookies():
 _setup_cookies()
 
 def _cookie_opts() -> dict:
+    """Return yt-dlp cookiefile option if cookies are available."""
     if _COOKIE_FILE and os.path.exists(_COOKIE_FILE):
         return {"cookiefile": _COOKIE_FILE}
     return {}
+
+
+# ─────────────────────────────────────────────
+# Directories
+# ─────────────────────────────────────────────
+
+# Primary: temp dir — file is streamed to browser → goes to system Downloads
+TEMP_DOWNLOAD_DIR = os.path.join(tempfile.gettempdir(), "nova_dvr_temp")
+os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
+
+# Secondary: user-configured persistent directory (optional)
+DEFAULT_DOWNLOAD_DIR = os.path.join(os.path.expanduser("~"), "Downloads", "NovaDVR")
+
+# ─────────────────────────────────────────────
+# SQLite Persistent Job Queue
 # ─────────────────────────────────────────────
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "jobs.db")
