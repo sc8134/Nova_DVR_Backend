@@ -323,6 +323,7 @@ def health():
         "total_jobs": total_jobs,
         "active_jobs": active_jobs,
         "error_log_count": error_count,
+        "cookies_loaded": _COOKIE_FILE is not None,
     })
 
 
