@@ -637,6 +637,7 @@ def download():
     format_id    = data.get("format_id", "").strip()
     is_audio     = data.get("is_audio", False)
     is_4k        = data.get("is_4k", False)
+    resolution   = data.get("resolution", "").strip()  # e.g. "1080p", "720p"
     custom_dir   = (data.get("download_dir") or "").strip()
     title        = data.get("title", "").strip()
 
@@ -649,9 +650,19 @@ def download():
     # Persist job to SQLite
     job_id = _db_add_job(url, title=title, format_id=format_id, is_audio=is_audio)
 
+    # ── Build resilient format string ──
+    # YouTube rotates format IDs — always include quality-based fallbacks
+    # so downloads succeed even if the exact format ID expires.
+
+    def _height_from_res(res: str) -> int:
+        """Extract pixel height from resolution label like '1080p' → 1080."""
+        try: return int(res.lower().replace("p", "").replace("k", "000"))
+        except: return 0
+
     if is_audio:
+        fmt = f"{format_id}/bestaudio[ext=m4a]/bestaudio"
         ydl_opts = {
-            "format": f"{format_id}/bestaudio",
+            "format": fmt,
             "outtmpl": os.path.join(save_dir, "%(title)s.%(ext)s"),
             "postprocessors": [{
                 "key": "FFmpegExtractAudio",
@@ -663,8 +674,23 @@ def download():
     else:
         if is_4k:
             fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+        elif resolution and resolution != "4K":
+            h = _height_from_res(resolution)
+            if h > 0:
+                # Try exact format ID first, then quality-based fallbacks
+                fmt = (
+                    f"{format_id}+bestaudio[ext=m4a]"
+                    f"/bestvideo[height={h}][ext=mp4]+bestaudio[ext=m4a]"
+                    f"/bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]"
+                    f"/bestvideo[height<={h}]+bestaudio"
+                    f"/best[height<={h}]"
+                    f"/best"
+                )
+            else:
+                fmt = f"{format_id}+bestaudio[ext=m4a]/bestaudio/{format_id}/best"
         else:
-            fmt = f"{format_id}+bestaudio[ext=m4a]/bestaudio/{format_id}"
+            fmt = f"{format_id}+bestaudio[ext=m4a]/bestaudio/{format_id}/best"
+
         ydl_opts = {
             "format": fmt,
             "outtmpl": os.path.join(save_dir, "%(title)s.%(ext)s"),
