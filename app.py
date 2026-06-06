@@ -26,22 +26,28 @@ CORS(app)
 # ffmpeg bootstrap — use bundled binary from imageio-ffmpeg if system
 # ffmpeg is not on PATH (covers Railway, Render, Heroku, etc.)
 # ─────────────────────────────────────────────
-def _bootstrap_ffmpeg():
-    import shutil
-    if shutil.which("ffmpeg"):
-        return  # system ffmpeg is fine
+def _find_ffmpeg():
+    import shutil, glob as _glob
+    found = shutil.which("ffmpeg")
+    if found:
+        logging.getLogger("nova_dvr").info(f"ffmpeg on PATH: {found}")
+        return found
+    for pattern in ["/nix/store/*/bin/ffmpeg", "/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg"]:
+        matches = _glob.glob(pattern)
+        if matches:
+            logging.getLogger("nova_dvr").info(f"ffmpeg at: {matches[0]}")
+            return matches[0]
     try:
         import imageio_ffmpeg
-        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
-        ffmpeg_dir  = os.path.dirname(ffmpeg_path)
-        current_path = os.environ.get("PATH", "")
-        if ffmpeg_dir not in current_path:
-            os.environ["PATH"] = ffmpeg_dir + os.pathsep + current_path
-        logging.getLogger("nova_dvr").info(f"Using bundled ffmpeg: {ffmpeg_path}")
-    except Exception as e:
-        logging.getLogger("nova_dvr").warning(f"imageio-ffmpeg not available: {e}")
+        p = imageio_ffmpeg.get_ffmpeg_exe()
+        logging.getLogger("nova_dvr").info(f"ffmpeg from imageio-ffmpeg: {p}")
+        return p
+    except Exception:
+        pass
+    logging.getLogger("nova_dvr").warning("ffmpeg NOT found")
+    return None
 
-_bootstrap_ffmpeg()
+FFMPEG_LOCATION = _find_ffmpeg()
 
 # ─────────────────────────────────────────────
 # Logging
@@ -94,10 +100,13 @@ def _setup_cookies():
 _setup_cookies()
 
 def _cookie_opts() -> dict:
-    """Return yt-dlp cookiefile option if cookies are available."""
+    """Return yt-dlp cookiefile + ffmpeg_location options."""
+    opts = {}
     if _COOKIE_FILE and os.path.exists(_COOKIE_FILE):
-        return {"cookiefile": _COOKIE_FILE}
-    return {}
+        opts["cookiefile"] = _COOKIE_FILE
+    if FFMPEG_LOCATION:
+        opts["ffmpeg_location"] = FFMPEG_LOCATION
+    return opts
 
 
 # ─────────────────────────────────────────────
