@@ -23,6 +23,27 @@ app = Flask(__name__)
 CORS(app)
 
 # ─────────────────────────────────────────────
+# ffmpeg bootstrap — use bundled binary from imageio-ffmpeg if system
+# ffmpeg is not on PATH (covers Railway, Render, Heroku, etc.)
+# ─────────────────────────────────────────────
+def _bootstrap_ffmpeg():
+    import shutil
+    if shutil.which("ffmpeg"):
+        return  # system ffmpeg is fine
+    try:
+        import imageio_ffmpeg
+        ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+        ffmpeg_dir  = os.path.dirname(ffmpeg_path)
+        current_path = os.environ.get("PATH", "")
+        if ffmpeg_dir not in current_path:
+            os.environ["PATH"] = ffmpeg_dir + os.pathsep + current_path
+        logging.getLogger("nova_dvr").info(f"Using bundled ffmpeg: {ffmpeg_path}")
+    except Exception as e:
+        logging.getLogger("nova_dvr").warning(f"imageio-ffmpeg not available: {e}")
+
+_bootstrap_ffmpeg()
+
+# ─────────────────────────────────────────────
 # Logging
 # ─────────────────────────────────────────────
 logging.basicConfig(
@@ -40,7 +61,7 @@ logger = logging.getLogger("nova_dvr")
 
 import base64 as _base64
 
-_COOKIE_FILE: str | None = None
+_COOKIE_FILE = None  # type: ignore
 
 def _setup_cookies():
     global _COOKIE_FILE
@@ -674,23 +695,26 @@ def download():
         }
     else:
         if is_4k:
-            fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+            # Prefer merge; fall back to a pre-merged single stream (no ffmpeg needed)
+            fmt = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
         elif resolution and resolution != "4K":
             h = _height_from_res(resolution)
             if h > 0:
-                # Try exact format ID first, then quality-based fallbacks
+                # Try merged streams first, then pre-merged single-file fallbacks
                 fmt = (
                     f"{format_id}+bestaudio[ext=m4a]"
                     f"/bestvideo[height={h}][ext=mp4]+bestaudio[ext=m4a]"
                     f"/bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]"
                     f"/bestvideo[height<={h}]+bestaudio"
+                    f"/best[height<={h}][ext=mp4]"
                     f"/best[height<={h}]"
+                    f"/best[ext=mp4]"
                     f"/best"
                 )
             else:
-                fmt = f"{format_id}+bestaudio[ext=m4a]/bestaudio/{format_id}/best"
+                fmt = f"{format_id}+bestaudio[ext=m4a]/bestaudio/{format_id}/best[ext=mp4]/best"
         else:
-            fmt = f"{format_id}+bestaudio[ext=m4a]/bestaudio/{format_id}/best"
+            fmt = f"{format_id}+bestaudio[ext=m4a]/bestaudio/{format_id}/best[ext=mp4]/best"
 
         ydl_opts = {
             "format": fmt,
@@ -772,7 +796,11 @@ def batch_download():
                 **_cookie_opts(),
             }
         else:
-            fmt = "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080]" if is_4k else f"{format_id}+bestaudio/best"
+            fmt = (
+                "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best[ext=mp4]/best"
+                if is_4k
+                else f"{format_id}+bestaudio[ext=m4a]/{format_id}+bestaudio/best[ext=mp4]/best"
+            )
             ydl_opts = {
                 "format": fmt,
                 "outtmpl": os.path.join(download_dir, "%(title)s.%(ext)s"),
@@ -1030,7 +1058,7 @@ def build_webpage_url(entry: dict, platform: str) -> str:
     return url_field or entry.get("webpage_url", "")
 
 
-def best_thumbnail(entry: dict) -> str | None:
+def best_thumbnail(entry: dict):
     """Safely extract the best thumbnail URL from a flat entry."""
     # Direct thumbnail string
     t = entry.get("thumbnail")
@@ -1679,7 +1707,7 @@ CLUSTER_RULES = [
     },
 ]
 
-def classify_title(title: str, uploader: str = "", duration: int | None = None) -> str | None:
+def classify_title(title: str, uploader: str = "", duration=None):
     """Score each cluster and return the highest-confidence label, or None."""
     title_lower  = (title or "").lower()
     upload_lower = (uploader or "").lower()
