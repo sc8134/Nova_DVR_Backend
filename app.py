@@ -13,7 +13,14 @@ import hashlib
 import glob
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timedelta
+from flask_jwt_extended import (
+    JWTManager, create_access_token, jwt_required,
+    get_jwt_identity, verify_jwt_in_request
+)
+from werkzeug.security import generate_password_hash, check_password_hash
+import secrets
+
 
 app = Flask(__name__)
 
@@ -148,6 +155,26 @@ def _init_db():
                 filepath    TEXT,
                 created_at  TEXT,
                 updated_at  TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                email           TEXT UNIQUE NOT NULL,
+                password_hash   TEXT NOT NULL,
+                tier            TEXT DEFAULT 'free',
+                tokens_today    INTEGER DEFAULT 5,
+                tokens_reset_at TEXT,
+                created_at      TEXT
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS referral_codes (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL,
+                code        TEXT UNIQUE NOT NULL,
+                used_by     INTEGER,
+                created_at  TEXT
             )
         """)
         conn.execute("""
@@ -331,6 +358,90 @@ VIDEO_HEIGHT_LABELS = {
     1440: "1440p",
     2160: "4K",
 }
+
+
+# ─────────────────────────────────────────────
+# Token / Tier system
+# ─────────────────────────────────────────────
+TIER_LIMITS = {
+    "free":       5,
+    "starter":    20,
+    "creator":    50,
+    "pro":        100,
+    "enterprise": 999999,
+}
+
+def _get_user_by_id(user_id: int):
+    with _db_lock:
+        conn = _db_conn()
+        row = conn.execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+        conn.close()
+    return dict(row) if row else None
+
+def _reset_tokens_if_needed(user: dict) -> dict:
+    """Reset daily tokens if the last reset was on a different UTC day."""
+    now = datetime.utcnow()
+    reset_at = user.get("tokens_reset_at")
+    needs_reset = True
+    if reset_at:
+        try:
+            last = datetime.fromisoformat(reset_at)
+            needs_reset = last.date() < now.date()
+        except Exception:
+            pass
+    if needs_reset:
+        limit = TIER_LIMITS.get(user.get("tier", "free"), 5)
+        with _db_lock:
+            conn = _db_conn()
+            conn.execute(
+                "UPDATE users SET tokens_today=?, tokens_reset_at=? WHERE id=?",
+                (limit, now.isoformat(), user["id"])
+            )
+            conn.commit()
+            conn.close()
+        user["tokens_today"]    = limit
+        user["tokens_reset_at"] = now.isoformat()
+    return user
+
+def _deduct_token(user_id: int) -> bool:
+    """Deduct one token. Returns False if no tokens remain."""
+    with _db_lock:
+        conn = _db_conn()
+        row = conn.execute("SELECT tokens_today FROM users WHERE id=?", (user_id,)).fetchone()
+        if not row or row[0] <= 0:
+            conn.close()
+            return False
+        conn.execute("UPDATE users SET tokens_today=tokens_today-1 WHERE id=?", (user_id,))
+        conn.commit()
+        conn.close()
+    return True
+
+def _optional_token_check():
+    """
+    If a valid JWT is present, check+deduct tokens.
+    Returns (user_id, error_response) — error_response is None on success.
+    If no JWT present, returns (None, None) — anonymous allowed.
+    """
+    try:
+        verify_jwt_in_request(optional=True)
+        from flask_jwt_extended import get_jwt_identity
+        user_id = get_jwt_identity()
+        if not user_id:
+            return None, None
+        user = _get_user_by_id(int(user_id))
+        if not user:
+            return None, None
+        user = _reset_tokens_if_needed(user)
+        if not _deduct_token(int(user_id)):
+            return int(user_id), (jsonify({
+                "error": "token_limit_reached",
+                "message": f"You've used all your downloads for today. Upgrade to get more.",
+                "tier": user.get("tier", "free"),
+                "tokens_today": 0,
+            }), 429)
+        return int(user_id), None
+    except Exception:
+        return None, None
 
 
 # ─────────────────────────────────────────────
@@ -663,6 +774,11 @@ def make_download_stream(ydl_opts, url, is_temp, job_id=None):
 # ─────────────────────────────────────────────
 @app.route("/download", methods=["POST"])
 def download():
+    # Token check — deduct 1 token if user is logged in
+    user_id, token_err = _optional_token_check()
+    if token_err:
+        return token_err
+
     data = request.json or {}
     url          = data.get("url", "").strip()
     format_id    = data.get("format_id", "").strip()
@@ -1934,6 +2050,197 @@ def chat():
         "url":      url,
         "format":   format_hint,
         "reply":    reply,
+    })
+
+
+# ─────────────────────────────────────────────
+# AUTH ROUTES
+# ─────────────────────────────────────────────
+
+@app.route("/auth/register", methods=["POST"])
+def auth_register():
+    data     = request.json or {}
+    email    = (data.get("email") or "").strip().lower()
+    password = (data.get("password") or "").strip()
+    referral = (data.get("referral_code") or "").strip().upper()
+
+    if not email or not password:
+        return jsonify({"error": "Email and password required"}), 400
+    if len(password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+    if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
+        return jsonify({"error": "Invalid email address"}), 400
+
+    pw_hash = generate_password_hash(password)
+    now     = datetime.utcnow().isoformat()
+    bonus   = 0
+
+    try:
+        with _db_lock:
+            conn = _db_conn()
+            cur = conn.execute(
+                "INSERT INTO users (email, password_hash, tier, tokens_today, tokens_reset_at, created_at) VALUES (?,?,?,?,?,?)",
+                (email, pw_hash, "free", TIER_LIMITS["free"], now, now)
+            )
+            new_id = cur.lastrowid
+
+            # Apply referral bonus
+            if referral:
+                ref_row = conn.execute(
+                    "SELECT * FROM referral_codes WHERE code=? AND used_by IS NULL", (referral,)
+                ).fetchone()
+                if ref_row:
+                    conn.execute(
+                        "UPDATE referral_codes SET used_by=? WHERE code=?", (new_id, referral)
+                    )
+                    bonus = 3
+                    conn.execute(
+                        "UPDATE users SET tokens_today=tokens_today+? WHERE id=?",
+                        (bonus, new_id)
+                    )
+                    conn.execute(
+                        "UPDATE users SET tokens_today=tokens_today+2 WHERE id=?",
+                        (ref_row["user_id"],)
+                    )
+
+            # Generate referral code for new user
+            new_code = secrets.token_hex(4).upper()
+            conn.execute(
+                "INSERT INTO referral_codes (user_id, code, created_at) VALUES (?,?,?)",
+                (new_id, new_code, now)
+            )
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        if "UNIQUE constraint failed" in str(e):
+            return jsonify({"error": "Email already registered"}), 409
+        return jsonify({"error": "Registration failed"}), 500
+
+    token = create_access_token(identity=str(new_id))
+    return jsonify({
+        "token":         token,
+        "user_id":       new_id,
+        "email":         email,
+        "tier":          "free",
+        "tokens_today":  TIER_LIMITS["free"] + bonus,
+        "tokens_limit":  TIER_LIMITS["free"],
+        "referral_code": new_code,
+        "message":       "Account created successfully" + (f" (+{bonus} bonus tokens for referral)" if bonus else ""),
+    }), 201
+
+
+@app.route("/auth/login", methods=["POST"])
+def auth_login():
+    data     = request.json or {}
+    email    = (data.get("email") or "").strip().lower()
+    password = (data.get("password") or "").strip()
+
+    if not email or not password:
+        return jsonify({"error": "Email and password required"}), 400
+
+    with _db_lock:
+        conn = _db_conn()
+        row = conn.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+        conn.close()
+
+    if not row or not check_password_hash(row["password_hash"], password):
+        return jsonify({"error": "Invalid email or password"}), 401
+
+    user = dict(row)
+    user = _reset_tokens_if_needed(user)
+
+    # Get referral code
+    with _db_lock:
+        conn = _db_conn()
+        ref_row = conn.execute(
+            "SELECT code FROM referral_codes WHERE user_id=? AND used_by IS NULL LIMIT 1",
+            (user["id"],)
+        ).fetchone()
+        conn.close()
+
+    token = create_access_token(identity=str(user["id"]))
+    return jsonify({
+        "token":         token,
+        "user_id":       user["id"],
+        "email":         user["email"],
+        "tier":          user["tier"],
+        "tokens_today":  user["tokens_today"],
+        "tokens_limit":  TIER_LIMITS.get(user["tier"], 5),
+        "referral_code": ref_row["code"] if ref_row else None,
+    })
+
+
+@app.route("/auth/me", methods=["GET"])
+@jwt_required()
+def auth_me():
+    user_id = int(get_jwt_identity())
+    user    = _get_user_by_id(user_id)
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    user = _reset_tokens_if_needed(user)
+
+    with _db_lock:
+        conn = _db_conn()
+        ref_row = conn.execute(
+            "SELECT code FROM referral_codes WHERE user_id=? LIMIT 1", (user_id,)
+        ).fetchone()
+        conn.close()
+
+    return jsonify({
+        "user_id":       user["id"],
+        "email":         user["email"],
+        "tier":          user["tier"],
+        "tokens_today":  user["tokens_today"],
+        "tokens_limit":  TIER_LIMITS.get(user["tier"], 5),
+        "referral_code": ref_row["code"] if ref_row else None,
+    })
+
+
+@app.route("/auth/refresh-tokens", methods=["POST"])
+@jwt_required()
+def auth_refresh_tokens():
+    """Manually trigger a daily token reset (for testing / admin)."""
+    user_id = int(get_jwt_identity())
+    user    = _get_user_by_id(user_id)
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    user["tokens_reset_at"] = None  # force reset
+    user = _reset_tokens_if_needed(user)
+    return jsonify({"tokens_today": user["tokens_today"], "tier": user["tier"]})
+
+
+@app.route("/auth/upgrade", methods=["POST"])
+@jwt_required()
+def auth_upgrade():
+    """
+    Manually upgrade a user tier (placeholder until Stripe is integrated).
+    Body: { "tier": "starter" | "creator" | "pro" | "enterprise" }
+    """
+    user_id = int(get_jwt_identity())
+    data    = request.json or {}
+    new_tier = data.get("tier", "").strip().lower()
+
+    if new_tier not in TIER_LIMITS:
+        return jsonify({"error": f"Invalid tier. Choose from: {list(TIER_LIMITS.keys())}"}), 400
+
+    now   = datetime.utcnow().isoformat()
+    limit = TIER_LIMITS[new_tier]
+
+    with _db_lock:
+        conn = _db_conn()
+        conn.execute(
+            "UPDATE users SET tier=?, tokens_today=?, tokens_reset_at=? WHERE id=?",
+            (new_tier, limit, now, user_id)
+        )
+        conn.commit()
+        conn.close()
+
+    return jsonify({
+        "tier":         new_tier,
+        "tokens_today": limit,
+        "tokens_limit": limit,
+        "message":      f"Upgraded to {new_tier} tier.",
     })
 
 

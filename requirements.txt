@@ -3,3 +3,5 @@ flask-cors==4.0.0
 yt-dlp>=2025.1.1
 gunicorn==22.0.0
 imageio-ffmpeg==0.5.1
+flask-jwt-extended==4.6.0
+werkzeug>=3.0.0
