@@ -2358,6 +2358,7 @@ STRIPE_PRICE_IDS = {
     "starter":    os.environ.get("STRIPE_PRICE_STARTER", ""),
     "creator":    os.environ.get("STRIPE_PRICE_CREATOR", ""),
     "pro":        os.environ.get("STRIPE_PRICE_PRO", ""),
+    "enterprise": os.environ.get("STRIPE_PRICE_ENTERPRISE", ""),
 }
 
 TIER_FROM_PRICE = {v: k for k, v in STRIPE_PRICE_IDS.items() if v}
@@ -2378,6 +2379,9 @@ def stripe_create_checkout():
     tier    = data.get("tier", "").strip().lower()
     success_url = data.get("success_url", "").strip()
     cancel_url  = data.get("cancel_url", "").strip()
+
+    if tier not in ("starter", "creator", "pro", "enterprise"):
+        return jsonify({"error": "Invalid tier"}), 400
 
     price_id = STRIPE_PRICE_IDS.get(tier)
     if not price_id:
