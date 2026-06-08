@@ -6,3 +6,4 @@ imageio-ffmpeg==0.5.1
 flask-jwt-extended==4.6.0
 werkzeug>=3.0.0
 google-auth==2.29.0
+stripe==9.12.0

@@ -2346,6 +2346,196 @@ def auth_google():
             }), 201
 
 
+# ─────────────────────────────────────────────
+# STRIPE PAYMENT ROUTES
+# ─────────────────────────────────────────────
+import stripe as _stripe
+
+_stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
+
+# Tier → Stripe Price ID mapping (set via env vars)
+STRIPE_PRICE_IDS = {
+    "starter":    os.environ.get("STRIPE_PRICE_STARTER", ""),
+    "creator":    os.environ.get("STRIPE_PRICE_CREATOR", ""),
+    "pro":        os.environ.get("STRIPE_PRICE_PRO", ""),
+}
+
+TIER_FROM_PRICE = {v: k for k, v in STRIPE_PRICE_IDS.items() if v}
+
+
+@app.route("/stripe/create-checkout", methods=["POST"])
+@jwt_required()
+def stripe_create_checkout():
+    """
+    Create a Stripe Checkout session for a subscription.
+    Body: { "tier": "starter" | "creator" | "pro", "success_url": "...", "cancel_url": "..." }
+    """
+    if not _stripe.api_key:
+        return jsonify({"error": "Stripe not configured on server"}), 500
+
+    user_id = int(get_jwt_identity())
+    data    = request.json or {}
+    tier    = data.get("tier", "").strip().lower()
+    success_url = data.get("success_url", "").strip()
+    cancel_url  = data.get("cancel_url", "").strip()
+
+    price_id = STRIPE_PRICE_IDS.get(tier)
+    if not price_id:
+        return jsonify({"error": f"No price configured for tier: {tier}"}), 400
+
+    user = _get_user_by_id(user_id)
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    try:
+        session = _stripe.checkout.Session.create(
+            mode="subscription",
+            payment_method_types=["card"],
+            line_items=[{"price": price_id, "quantity": 1}],
+            success_url=success_url or "https://nova-dvr.vercel.app/pricing?success=1",
+            cancel_url=cancel_url or "https://nova-dvr.vercel.app/pricing?cancelled=1",
+            client_reference_id=str(user_id),
+            customer_email=user.get("email"),
+            metadata={"user_id": str(user_id), "tier": tier},
+            subscription_data={"metadata": {"user_id": str(user_id), "tier": tier}},
+        )
+        return jsonify({"checkout_url": session.url, "session_id": session.id})
+    except Exception as e:
+        logger.error(f"Stripe checkout error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/stripe/webhook", methods=["POST"])
+def stripe_webhook():
+    """
+    Stripe webhook — upgrades user tier on successful payment.
+    Set STRIPE_WEBHOOK_SECRET in Railway env vars.
+    Webhook URL: https://novadvrbackend-production.up.railway.app/stripe/webhook
+    """
+    payload    = request.get_data()
+    sig_header = request.headers.get("Stripe-Signature", "")
+    webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+
+    if webhook_secret:
+        try:
+            event = _stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
+        except Exception as e:
+            logger.warning(f"Stripe webhook signature error: {e}")
+            return jsonify({"error": "Invalid signature"}), 400
+    else:
+        try:
+            event = _stripe.Event.construct_from(
+                __import__("json").loads(payload), _stripe.api_key
+            )
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+
+    event_type = event["type"]
+    logger.info(f"Stripe webhook: {event_type}")
+
+    if event_type in ("checkout.session.completed", "invoice.payment_succeeded"):
+        obj = event["data"]["object"]
+
+        # Get metadata from subscription or session
+        metadata = obj.get("metadata") or {}
+        user_id_str = metadata.get("user_id")
+        tier = metadata.get("tier")
+
+        # Fallback: look up via subscription
+        if not user_id_str and obj.get("subscription"):
+            try:
+                sub = _stripe.Subscription.retrieve(obj["subscription"])
+                metadata = sub.get("metadata") or {}
+                user_id_str = metadata.get("user_id")
+                tier = metadata.get("tier")
+                # Try price ID mapping
+                if not tier and sub.get("items", {}).get("data"):
+                    price_id = sub["items"]["data"][0]["price"]["id"]
+                    tier = TIER_FROM_PRICE.get(price_id)
+            except Exception as e:
+                logger.warning(f"Could not retrieve subscription: {e}")
+
+        if user_id_str and tier and tier in TIER_LIMITS:
+            try:
+                uid = int(user_id_str)
+                now = datetime.utcnow().isoformat()
+                limit = TIER_LIMITS[tier]
+                with _db_lock:
+                    conn = _db_conn()
+                    conn.execute(
+                        "UPDATE users SET tier=?, tokens_today=?, tokens_reset_at=? WHERE id=?",
+                        (tier, limit, now, uid)
+                    )
+                    conn.commit()
+                    conn.close()
+                logger.info(f"User {uid} upgraded to {tier}")
+            except Exception as e:
+                logger.error(f"Failed to upgrade user: {e}")
+
+    elif event_type in ("customer.subscription.deleted", "customer.subscription.paused"):
+        obj = event["data"]["object"]
+        metadata = obj.get("metadata") or {}
+        user_id_str = metadata.get("user_id")
+        if user_id_str:
+            try:
+                uid = int(user_id_str)
+                now = datetime.utcnow().isoformat()
+                limit = TIER_LIMITS["free"]
+                with _db_lock:
+                    conn = _db_conn()
+                    conn.execute(
+                        "UPDATE users SET tier='free', tokens_today=?, tokens_reset_at=? WHERE id=?",
+                        (limit, now, uid)
+                    )
+                    conn.commit()
+                    conn.close()
+                logger.info(f"User {uid} downgraded to free (subscription cancelled)")
+            except Exception as e:
+                logger.error(f"Failed to downgrade user: {e}")
+
+    return jsonify({"received": True})
+
+
+@app.route("/stripe/portal", methods=["POST"])
+@jwt_required()
+def stripe_portal():
+    """
+    Create a Stripe Customer Portal session so users can manage their subscription.
+    Body: { "return_url": "..." }
+    """
+    if not _stripe.api_key:
+        return jsonify({"error": "Stripe not configured"}), 500
+
+    user_id = int(get_jwt_identity())
+    data    = request.json or {}
+    return_url = data.get("return_url", "https://nova-dvr.vercel.app/pricing")
+
+    user = _get_user_by_id(user_id)
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+
+    # Find or create Stripe customer
+    try:
+        customers = _stripe.Customer.list(email=user["email"], limit=1)
+        if customers.data:
+            customer_id = customers.data[0].id
+        else:
+            customer = _stripe.Customer.create(
+                email=user["email"],
+                metadata={"user_id": str(user_id)},
+            )
+            customer_id = customer.id
+
+        session = _stripe.billing_portal.Session.create(
+            customer=customer_id,
+            return_url=return_url,
+        )
+        return jsonify({"portal_url": session.url})
+    except Exception as e:
+        logger.error(f"Stripe portal error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("FLASK_ENV", "development") != "production"
