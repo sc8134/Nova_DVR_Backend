@@ -2244,6 +2244,108 @@ def auth_upgrade():
     })
 
 
+# ─────────────────────────────────────────────
+# /auth/google  – Google OAuth sign-in / sign-up
+# Frontend sends the Google ID token; backend verifies and issues JWT
+# ─────────────────────────────────────────────
+
+@app.route("/auth/google", methods=["POST"])
+def auth_google():
+    """
+    Body: { "id_token": "<google id token from frontend>" }
+    Returns same shape as /auth/login
+    """
+    data     = request.json or {}
+    id_token = (data.get("id_token") or "").strip()
+
+    if not id_token:
+        return jsonify({"error": "id_token required"}), 400
+
+    client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
+    if not client_id:
+        return jsonify({"error": "Google OAuth not configured on server"}), 500
+
+    # Verify the Google token
+    try:
+        from google.oauth2 import id_token as google_id_token
+        from google.auth.transport import requests as google_requests
+        idinfo = google_id_token.verify_oauth2_token(
+            id_token,
+            google_requests.Request(),
+            client_id,
+        )
+    except Exception as e:
+        logger.warning(f"Google token verification failed: {e}")
+        return jsonify({"error": "Invalid Google token"}), 401
+
+    google_email = idinfo.get("email", "").lower().strip()
+    google_name  = idinfo.get("name", "")
+
+    if not google_email:
+        return jsonify({"error": "Could not retrieve email from Google"}), 400
+
+    now = datetime.utcnow().isoformat()
+
+    with _db_lock:
+        conn = _db_conn()
+        row = conn.execute("SELECT * FROM users WHERE email=?", (google_email,)).fetchone()
+
+        if row:
+            # Existing user — log in
+            user = dict(row)
+            conn.close()
+            user = _reset_tokens_if_needed(user)
+
+            ref_row_conn = _db_conn()
+            ref_row = ref_row_conn.execute(
+                "SELECT code FROM referral_codes WHERE user_id=? LIMIT 1", (user["id"],)
+            ).fetchone()
+            ref_row_conn.close()
+
+            token = create_access_token(identity=str(user["id"]))
+            return jsonify({
+                "token":         token,
+                "user_id":       user["id"],
+                "email":         user["email"],
+                "tier":          user["tier"],
+                "tokens_today":  user["tokens_today"],
+                "tokens_limit":  TIER_LIMITS.get(user["tier"], 5),
+                "referral_code": ref_row["code"] if ref_row else None,
+                "is_new":        False,
+            })
+        else:
+            # New user — register via Google
+            # Use a random unusable password (Google users never use password login)
+            import secrets as _sec
+            pw_hash = generate_password_hash(_sec.token_hex(32))
+            cur = conn.execute(
+                "INSERT INTO users (email, password_hash, tier, tokens_today, tokens_reset_at, created_at) VALUES (?,?,?,?,?,?)",
+                (google_email, pw_hash, "free", TIER_LIMITS["free"], now, now)
+            )
+            new_id = cur.lastrowid
+
+            new_code = _sec.token_hex(4).upper()
+            conn.execute(
+                "INSERT INTO referral_codes (user_id, code, created_at) VALUES (?,?,?)",
+                (new_id, new_code, now)
+            )
+            conn.commit()
+            conn.close()
+
+            token = create_access_token(identity=str(new_id))
+            return jsonify({
+                "token":         token,
+                "user_id":       new_id,
+                "email":         google_email,
+                "tier":          "free",
+                "tokens_today":  TIER_LIMITS["free"],
+                "tokens_limit":  TIER_LIMITS["free"],
+                "referral_code": new_code,
+                "is_new":        True,
+                "message":       f"Welcome, {google_name or google_email}! Account created.",
+            }), 201
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("FLASK_ENV", "development") != "production"
